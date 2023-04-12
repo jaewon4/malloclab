@@ -24,7 +24,6 @@ static void *coalesce(void *bp);
 static void *extend_heap(size_t words);
 static void add_free_block(void *bp);
 static void remove_free_block(void *bp);
-static int find_index(size_t asize);
 
 /*********************************************************
  * NOTE TO STUDENTS: Before you do anything else, please
@@ -61,32 +60,44 @@ team_t team = {
 #define FTRP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)) - DSIZE) // 블록의 footer 주소 반환
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(((char *)(bp) - WSIZE))) // 다음 블록의 주소 반환
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE))) // 이전 블록의 주소 반환
-#define NEXT_LINK(bp) (*(char **)(bp + WSIZE))                                   // next 포인터 위치
-#define PREV_LINK(bp) (*(char **)(bp))                           // prev 포인터 위치
+#define NEXT_LINK(bp) (*(char **)(bp + WSIZE))                           // next 포인터 위치
+#define PREV_LINK(bp) (*(char **)(bp))                                   // prev 포인터 위치
 #define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
-#define LIST_LIMIT 8
+
 static char *heap_listp = NULL; // 힙의 시작 주소를 가리킴
-void *free_listp[LIST_LIMIT]; // 명시적 가용 리스트(explicit)의 첫 노드를 가리킴
+static char *free_listp = NULL; // 명시적 가용 리스트(explicit)의 첫 노드를 가리킴
 
 int mm_init(void)
 {
-    for (int i=0; i < LIST_LIMIT; i++) {
-        free_listp[i] = NULL;
-    }      
-    if ((heap_listp = mem_sbrk(4*WSIZE)) == (void*)-1)
+    /* 메모리에서 6words를 가져오고 이걸로 빈 가용 리스트 초기화 */
+    /* padding, prol_header, NEXT, PREV, prol_footer, epil_header */
+    if ((heap_listp = mem_sbrk(6*WSIZE)) == (void*)-1)
         return -1;
 
     PUT(heap_listp, 0);  // Alignment padding. 더블 워드 경계로 정렬된 미사용 패딩.
-    PUT(heap_listp + (1*WSIZE), PACK(DSIZE, 1));  // prologue header
-    PUT(heap_listp + (2*WSIZE), PACK(DSIZE, 1));  // prologue footer
-    PUT(heap_listp + (3*WSIZE), PACK(0, 1));      // epliogue header
-  
+    PUT(heap_listp + (1*WSIZE), PACK(DSIZE * 2, 1));  // prologue header
+    PUT(heap_listp + (2*WSIZE), (int)NULL);  // prologue block안의 PREV 포인터 NULL로 초기화
+    PUT(heap_listp + (3*WSIZE), (int)NULL);  // prologue block안의 NEXT 포인터 NULL로 초기화
+    PUT(heap_listp + (4*WSIZE), PACK(DSIZE * 2, 1));  // prologue footer
+    PUT(heap_listp + (5*WSIZE), PACK(0, 1));      // epliogue header
+
+    free_listp = heap_listp + DSIZE; // free_listp를 탐색의 시작점으로 둔다. 
+   
+    /* 그 후 CHUNKSIZE만큼 힙을 확장해 초기 가용 블록을 생성한다. */
     if (extend_heap(CHUNKSIZE / WSIZE) == NULL) //실패하면 -1 리턴
         return -1;
 
     return 0;
 }
 
+/*
+ * extend_heap : 힙의 크기를 늘려주는 함수이다. 
+            매개변수 words 를 통해 늘려주고자 하는 힙의 크기를 받는다.
+            더블워드 정렬을 위해 짝수개의 DSIZE만큼의 크기를 늘린다.
+            새로 추가된 힙영역은 하나의 가용 블럭이므로 
+            header, footer 등의 값을 초기화한다.
+            이 후 coalesce()를 호출하여 전 블럭과 병합이 가능한 경우 병합을 진행한다.
+ */
 static void *extend_heap(size_t words)
 {
     char *bp;
@@ -102,6 +113,9 @@ static void *extend_heap(size_t words)
     return coalesce(bp); // 연속된 free 블록 합체
 }
 
+/*
+ * mm_free - Freeing a block does nothing.
+ */
 void mm_free (void *bp)
 {
     size_t size = GET_SIZE(HDRP(bp));
@@ -110,44 +124,37 @@ void mm_free (void *bp)
     coalesce(bp); // 이전 이후 블럭의 할당 정보를 확인하여 병합하고, free-list에 추가
 }
 
-int find_index(size_t asize){
-    int index = 0;
-    for (int i = 0; i < LIST_LIMIT - 1; i++){
-        if (asize <= (1 << i)){
-            break;
-        }
-        index++;
-    }
-    return index;
-}
-
 // bp가 들어오면 next, prev블록을 이어준다.
 static void add_free_block(void *bp){
-    int index = find_index(GET_SIZE(HDRP(bp)));
-
-    NEXT_LINK(bp) = free_listp[index];
-    if (free_listp[index] != NULL){
-        PREV_LINK(free_listp[index]) = bp;
-    }
-    free_listp[index] = bp;
-
+    NEXT_LINK(bp) = free_listp;
+    PREV_LINK(free_listp) = bp;
+    PREV_LINK(bp) = NULL;
+    // free블록을 추가하므로 free를 갱신하여 LIFO구조를 유지시킨다.
+    free_listp = bp;
 }
 
-
+// 맨앞이나 중간 free블록을 해제 연결하는 함수
 static void remove_free_block(void *bp){
-    int index = find_index(GET_SIZE(HDRP(bp)));
-    if (free_listp[index] == bp){
-        free_listp[index] = NEXT_LINK(bp);
+    // free list에서 맨앞 블록을 삭제하는 경우
+    if (free_listp == bp){
+        PREV_LINK(NEXT_LINK(bp)) = NULL;
+        // 맨 앞부분을 삭제하는 것이므로 free를 뒤로 이동시켜줘야함
+        free_listp = NEXT_LINK(bp);
     }
+    // free list에서 중간 블록을 삭제하는 경우
     else{
+        PREV_LINK(NEXT_LINK(bp)) = PREV_LINK(bp);
         NEXT_LINK(PREV_LINK(bp)) = NEXT_LINK(bp);
-        if (NEXT_LINK(bp) != NULL){
-            PREV_LINK(NEXT_LINK(bp)) = PREV_LINK(bp);
-        }
+        // free는 LIFO구조로 신규노드 삽입시 항상 맨압 신규노드의 bp를 
+        // 가리키고 있으므로 중간블록을 삭제하는 경우 갱신하지 않는다.
     }
 }
 
-
+/*
+ * coalesce : 현재 bp가 가리키는 블록의 이전 블록과 다음 블록의 할당 여부를 
+            확인하여 가용 블럭(free)이 있다면 현재 블록과 인접 가용 블럭을 
+            하나의 가용 블럭으로 합친다.
+ */
 static void *coalesce(void *bp)
 {
     size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
@@ -190,7 +197,10 @@ static void *coalesce(void *bp)
 }
 
 
-
+/* 
+ * mm_malloc - brk 포인터를 증가시켜 블록을 할당합니다.
+ *            항상 크기가 정렬의 배수인 블록을 할당합니다.
+ */
 void *mm_malloc(size_t size)
 {
     size_t asize;
@@ -218,23 +228,31 @@ void *mm_malloc(size_t size)
     return bp;
 }
 
-
+/*
+ * find_fit : 할당할 블록을 최초 할당 방식으로 찾는 함수
+            명시적 가용 리스트의 처음부터 마지막부분에 도달할 때까지
+            가용 리스트를 탐색하면서 사이즈가 asize보다 크거나 같은 블럭을
+            찾으면 그 블럭의 주소를 반환한다. 
+ */
 static void *find_fit(size_t asize){
+    // first-fit search
     char* bp;
-    int index = find_index(asize);
 
-    for (int i = index; i < LIST_LIMIT; i++){
-        for (bp = free_listp[i]; bp != NULL; bp = NEXT_LINK(bp)){
-            if(asize <= GET_SIZE(HDRP(bp))){
-                return bp;
-            }
+    // start the search from the begining of the heap
+    for (bp = free_listp; GET_ALLOC(HDRP(bp)) != 1; bp = NEXT_LINK(bp)){
+        if(asize <= GET_SIZE(HDRP(bp))){
+            return bp;
         }
     }
     
     return NULL;
 }
 
-
+/*
+ * place : 지정된 크기의 블럭을 find_fit을 통해 찾은 free 블럭에 배치(할당)한다.
+        만약 free 블럭에서 동적할당을 받고자하는 블럭의 크기를 제하여도
+        또 다른 free블럭을 만들 수 있다면(2 * DSIZE 보다 큰 경우), free 블럭을 쪼갠다.
+ */
 static void place(void *bp, size_t asize){
     size_t old_size = GET_SIZE(HDRP(bp));
     remove_free_block(bp);
@@ -254,7 +272,11 @@ static void place(void *bp, size_t asize){
     }
 }
 
-
+/*
+ * mm_realloc - 기존에 할당된 메모리 블록의 크기를 변경하고, 변경된 크기에 맞게 
+                새로운 메모리 블록을 할당하고 기존 메모리 블록의 데이터를 새로운
+                메모리 블록으로 복사하는 것
+ */
 void *mm_realloc(void *ptr, size_t size)
 {
     void *oldptr = ptr; // realloc 함수가 호출될 때 인자로 전달된 기존 메모리 블록의 주소를 저장
@@ -273,3 +295,17 @@ void *mm_realloc(void *ptr, size_t size)
     mm_free(oldptr); // 기존 메모리 블록을 해제
     return newptr; // 새로 할당된 메모리 블록의 주소를 반환
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
